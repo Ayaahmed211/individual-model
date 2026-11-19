@@ -18,7 +18,7 @@ from t1dsim_ai.individual_model import DigitalTwin
 # ---------------------------------------------------------------------------
 # CONFIGURATION: Change subject ID or pass as command line argument
 # ---------------------------------------------------------------------------
-TARGET_USUBJID =  "1312"         # <-- Change subject ID here! (e.g. 0102, 0692, 0794, 0880, 1047)
+TARGET_USUBJID =  "0043"         # <-- Change subject ID here! (e.g. 0102, 0692, 0794, 0880, 1047)
 
 # Which 1-day window of the test set to simulate (0 = first day, 1 = second day, ...).
 # Set to None to auto-pick the day with the most variety in heart_rate/sleep_efficiency.
@@ -36,9 +36,12 @@ CLEAN_TARGET = TARGET_USUBJID.lstrip('0') if TARGET_USUBJID.lstrip('0') else TAR
 SUBJECT_ID = f"T1DEXI-01-{CLEAN_TARGET.zfill(4)}"
 
 # CSV Dataset Path
-CSV_PATH = f"src/t1dsim_ai/models/IndividualModel/{SUBJECT_ID}/T1DEXIMAIN_{SUBJECT_ID}.csv"
+DATA_PROCESSED_DIR = r"D:\data_processed"
+CSV_PATH = os.path.join(DATA_PROCESSED_DIR, f"{SUBJECT_ID}.csv")
 if not os.path.exists(CSV_PATH):
     CSV_PATH = f"data_processed/{SUBJECT_ID}.csv"
+if not os.path.exists(CSV_PATH):
+    CSV_PATH = f"src/t1dsim_ai/models/IndividualModel/{SUBJECT_ID}/T1DEXIMAIN_{SUBJECT_ID}.csv"
 
 # YOUR TRAINED MODEL PATH (Strictly from output_models/)
 YOUR_TRAINED_MODEL_DIR = os.path.abspath(f"output_models/{SUBJECT_ID}/")
