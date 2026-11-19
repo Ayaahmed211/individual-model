@@ -290,9 +290,7 @@ def main():
 
     if TEST_MODE:
         # User can add any specific subjects to this list to test them:
-        subject_ids = [ "TT1DEXI-01-0781", "T1DEXI-01-1493", "T1DEXI-01-0436", "T1DEXI-01-1312", "T1DEXI-01-0446"]
-        # Only keep subjects that are actually in the included list (optional safety check)
-        # subject_ids = [s for s in subject_ids if s in subject_ids_raw]
+        subject_ids = ["T1DEXI-01-0043"]
         print(f" [TEST MODE] Training only the specified subjects: {subject_ids}\n")
 
     results = []
