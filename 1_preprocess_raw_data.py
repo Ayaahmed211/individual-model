@@ -1,35 +1,37 @@
 """
 =============================================================================
-  Step 1 (FIXED v2 + BATCH): Raw Data Preprocessing for T1DEXI Dataset
+  Step 1 (FIXED v3 + BATCH): Raw Data Preprocessing for T1DEXI Dataset
 =============================================================================
 Same batch driver as before (loops over every subject in
-included_subjects.csv), with two fixes to the heart-rate and sleep inputs.
-Both were found by inspecting VS.xpt / NV.xpt and the define.xml:
+included_subjects.csv). Only the HEART-RATE baseline / scaling changed in v3
+(everything else is identical to v2):
 
-  A. HEART RATE: VS.xpt holds TWO heart-rate series per subject.
-       - VSTESTCD == 'HR'  : ~10-60k rows, many rows share the SAME VSDTC /
-         VSENDTC (a ~20-30 min window), i.e. the individual samples do not
-         carry their own timestamps. Using it gave a nearly flat signal
-         with a few jumps after forward-fill.
-       - VSTESTCD == 'HRM' : ~200-260k rows of 10-second wearable samples
-         (median gap ~0.2 min). This is the continuous signal.
-     Now: HRM, averaged into each 5-minute bucket. Gaps up to
-     HR_MAX_GAP_BUCKETS buckets (30 min) are linearly interpolated; longer
-     gaps (watch off) are filled with the subject's median HR, i.e. "no
-     deviation from baseline", instead of repeating the last value for hours.
-     heart_rate_WRTbaseline now uses the MEDIAN HR as baseline (closer to
-     the paper's "average HR at rest" than the mean, which exercise pulls up).
+  v3 change 1 - HR BASELINE = mean HR at REST (paper Section 2.4.1)
+      The paper defines the baseline as "the average heart rate during
+      periods of rest, when no exercise was being performed".
+      Before: median of ALL HR (exercise included, whole recording).
+      Now:    mean of the observed 5-min HR buckets that are
+                (a) inside the TRAINING period only (first TRAIN_DAYS days), and
+                (b) outside every logged exercise window.
+      Exercise windows come from PR.xpt (define.xml: PRSTDTC = start of the
+      reported activity, PLNEXDUR = reported activity duration in minutes),
+      padded by EXERCISE_PAD_BEFORE_MIN before and EXERCISE_PAD_AFTER_MIN
+      after (HR needs time to come back down).
+      If a subject has no PR records (or too few rest buckets), a documented
+      fallback is used and printed in the log.
 
-  B. SLEEP EFFICIENCY: NV.xpt records have NVDTC (start) and NVENDTC (end),
-     and there is no NVSTDTC column. The old code ignored NVENDTC and
-     matched each record to the grid with a +-30 min tolerance, so every
-     sleep session became a ~1 hour pulse. Now the value is held over the
-     whole [NVDTC, NVENDTC) interval. If NVENDTC is missing, only the single
-     5-minute bucket of NVDTC is filled.
+  v3 change 2 - ROBUST SCALING of the HR deviation (paper, Appendix C)
+      scaled = (x - median) / IQR  with x = heart_rate - baseline.
+      median / IQR are computed from the TRAINING rows only and are applied
+      unchanged to the test rows (no leakage). The constants are saved per
+      subject to  <subject_id>_hr_scaler.json  so the model code can
+      re-use them. New CSV column: heart_rate_WRTbaseline_scaled
+      (heart_rate_WRTbaseline is still written, in raw BPM).
 
-Everything else (carbs, insulin, CGM, train/test split) is unchanged.
-The log now prints coverage statistics so you can see whether the HR / sleep
-inputs actually carry information for each subject.
+Inherited from v2:
+  A. HEART RATE uses VSTESTCD == 'HRM', averaged into 5-min buckets, gaps up
+     to HR_MAX_GAP_BUCKETS interpolated, longer gaps filled with the baseline.
+  B. SLEEP EFFICIENCY is held over the whole [NVDTC, NVENDTC) interval.
 
 USAGE:
     python preprocess_all_subjects.py
@@ -42,9 +44,12 @@ column (e.g. T1DEXI-01-1004, T1DEXI-01-0692, T1DEXI-01-0011).
 import os
 import re
 import sys
+import json
 import traceback
 import pandas as pd
 import numpy as np
+
+from meal_reconciliation import reconcile_meals, print_stats
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -70,6 +75,13 @@ TRAIN_DAYS = 14  # first two weeks = train, matching paper Section 2.4.1
 HR_TEST_CODE = "HRM"        # continuous 10-second wearable heart rate
 HR_MAX_GAP_BUCKETS = 6      # interpolate HR gaps up to 6 x 5 min = 30 min
 HR_DEFAULT_BASELINE = 64.0  # only used if a subject has no HR data at all
+
+# --- exercise exclusion for the HR baseline (v3) ---------------------------
+EXERCISE_PAD_BEFORE_MIN = 15        # HR can start rising before the logged start
+EXERCISE_PAD_AFTER_MIN = 60         # recovery time after the logged end
+DEFAULT_EXERCISE_DURATION_MIN = 60  # used when PLNEXDUR is missing / <= 0
+MIN_REST_BUCKETS = 288              # need >= 1 day (288 x 5 min) of rest HR
+MIN_SCALER_BUCKETS = 100            # min observed train buckets to fit scaler
 
 BATCH_REPORT_CSV = "batch_run_report.csv"
 
@@ -175,31 +187,117 @@ def build_basal_dose_series(df_basal, grid, freq_min=GRID_FREQ_MIN):
     return out
 
 
-def build_hr_series(df_hr, grid, freq_min=GRID_FREQ_MIN,
-                    max_gap_buckets=HR_MAX_GAP_BUCKETS,
-                    default_baseline=HR_DEFAULT_BASELINE):
-    """df_hr has 'datetime' and 'heart_rate' (10-second HRM samples).
-    Returns (hr_series, baseline, observed_mask) on the 5-minute grid:
-      - each bucket = mean of the samples falling inside it
-      - gaps <= max_gap_buckets are linearly interpolated (in time)
-      - longer gaps / edges are filled with the baseline (median HR)
-    observed_mask marks buckets that had real samples (before any filling)."""
-    if len(df_hr) == 0:
-        return (pd.Series(default_baseline, index=grid), default_baseline,
-                pd.Series(False, index=grid))
+# ---------------------------------------------------------------------------
+# Heart rate helpers (v3)
+# ---------------------------------------------------------------------------
+def parse_sdtm_datetime(s):
+    """Parse an SDTM date/time column.
+    - numeric column  -> epoch seconds (same convention as VSDTC / LBDTC / FADTC)
+    - text column     -> ISO-8601 string (define.xml lists PRSTDTC as *text*)
+    Result is always tz-naive. NOTE: ISO strings that carry a UTC offset are
+    converted to UTC first; if you see exercise windows shifted relative to
+    the HR curve, check this (the log prints the first PR start time)."""
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_datetime(s, unit='s', errors='coerce')
+    try:
+        out = pd.to_datetime(s, errors='coerce', utc=True, format='ISO8601')   # pandas >= 2.0
+    except (ValueError, TypeError):
+        out = pd.to_datetime(s, errors='coerce', utc=True)                      # older pandas
+    return out.dt.tz_localize(None)
 
+
+def load_exercise_intervals(target_clean):
+    """Exercise sessions for one subject from PR.xpt.
+    PRSTDTC = start, PLNEXDUR = reported duration in minutes (define.xml).
+    Returns a DataFrame with columns ['start', 'end'] (possibly empty)."""
+    empty = pd.DataFrame({'start': pd.to_datetime([]), 'end': pd.to_datetime([])})
+    sub_pr = read_full_for_subject(
+        "PR.xpt", target_clean,
+        keep_cols=['USUBJID', 'PRTRT', 'PRCAT', 'PRSTDTC', 'PLNEXDUR']
+    )
+    if len(sub_pr) == 0 or 'PRSTDTC' not in sub_pr.columns:
+        return empty
+    start = parse_sdtm_datetime(sub_pr['PRSTDTC'])
+    if 'PLNEXDUR' in sub_pr.columns:
+        dur = pd.to_numeric(sub_pr['PLNEXDUR'], errors='coerce')
+    else:
+        dur = pd.Series(np.nan, index=sub_pr.index)
+    dur = dur.where(dur > 0).fillna(DEFAULT_EXERCISE_DURATION_MIN)
+    iv = pd.DataFrame({'start': start, 'end': start + pd.to_timedelta(dur, unit='m')})
+    iv = iv.dropna(subset=['start']).sort_values('start').reset_index(drop=True)
+    return iv
+
+
+def build_exercise_mask(df_exercise, grid):
+    """Boolean Series on the grid: True inside any exercise window
+    [start - PAD_BEFORE, end + PAD_AFTER]."""
+    mask = np.zeros(len(grid), dtype=bool)
+    for _, r in df_exercise.iterrows():
+        s = r['start'] - pd.Timedelta(minutes=EXERCISE_PAD_BEFORE_MIN)
+        e = r['end'] + pd.Timedelta(minutes=EXERCISE_PAD_AFTER_MIN)
+        i0 = grid.searchsorted(s, side="left")
+        i1 = grid.searchsorted(e, side="right")
+        mask[i0:i1] = True
+    return pd.Series(mask, index=grid)
+
+
+def bucket_hr(df_hr, grid, freq_min=GRID_FREQ_MIN):
+    """5-minute mean of the raw HR samples on the grid. NaN where the
+    wearable produced no samples (nothing is filled here)."""
+    if df_hr is None or len(df_hr) == 0:
+        return pd.Series(np.nan, index=grid)
     bucket_mean = df_hr.groupby(df_hr['datetime'].dt.floor(f"{freq_min}min"))['heart_rate'].mean()
-    hr = bucket_mean.reindex(grid)
-    observed = hr.notna()
-    baseline = float(hr.median()) if observed.any() else default_baseline
+    return bucket_mean.reindex(grid)
 
-    is_na = hr.isna()
+
+def compute_hr_baseline(hr_raw, exercise_mask, train_mask, has_exercise_log,
+                        default_baseline=HR_DEFAULT_BASELINE):
+    """Baseline = mean HR at rest (paper): observed buckets, TRAIN period only,
+    outside exercise windows. Returns (baseline, method_description)."""
+    observed_train = hr_raw.notna() & train_mask
+    if not observed_train.any():
+        return default_baseline, "default (no HR in training period)"
+    if has_exercise_log:
+        rest = observed_train & ~exercise_mask
+        if int(rest.sum()) >= MIN_REST_BUCKETS:
+            return float(hr_raw[rest].mean()), \
+                f"rest mean ({int(rest.sum())} observed buckets outside exercise)"
+    # Fallback: no exercise log, or too little rest data. Approximate "rest"
+    # as the lower half of the observed training HR distribution.
+    vals = hr_raw[observed_train]
+    low = vals[vals <= vals.median()]
+    why = "no PR exercise records" if not has_exercise_log else "too few rest buckets"
+    return float(low.mean()), f"FALLBACK mean of HR <= median ({why})"
+
+
+def fill_hr_series(hr_raw, baseline, max_gap_buckets=HR_MAX_GAP_BUCKETS):
+    """Gaps <= max_gap_buckets are linearly interpolated (in time); longer
+    gaps / edges are filled with the baseline ("no deviation")."""
+    is_na = hr_raw.isna()
+    if not is_na.any():
+        return hr_raw.copy()
     run_id = (is_na != is_na.shift()).cumsum()
     run_len = is_na.groupby(run_id).transform("sum")   # length of each NaN run
-    interpolated = hr.interpolate(method="time", limit_area="inside")
+    interpolated = hr_raw.interpolate(method="time", limit_area="inside")
     too_long = is_na & (run_len > max_gap_buckets)
-    hr_filled = interpolated.mask(too_long).fillna(baseline)
-    return hr_filled, baseline, observed
+    return interpolated.mask(too_long).fillna(baseline)
+
+
+def fit_robust_scaler(x):
+    """Robust scaler constants: center = median, scale = IQR (Q75 - Q25).
+    Falls back to the std (then 1.0) if the IQR is ~0, e.g. when most values
+    are exactly 0 because of baseline-filled gaps."""
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return 0.0, 1.0
+    center = float(np.median(x))
+    q25, q75 = np.percentile(x, [25, 75])
+    scale = float(q75 - q25)
+    if scale < 1e-6:
+        std = float(np.std(x))
+        scale = std if std > 1e-6 else 1.0
+    return center, scale
 
 
 def build_sleep_series(df_sleep, grid, freq_min=GRID_FREQ_MIN):
@@ -253,6 +351,7 @@ def preprocess_subject(target_usubjid):
     clean_target = target_usubjid.lstrip('0') if target_usubjid.lstrip('0') else target_usubjid
     subject_id = f"T1DEXI-01-{clean_target.zfill(4)}"
     output_csv = os.path.join(DATA_PROCESSED_DIR, f"{subject_id}.csv")
+    scaler_json = os.path.join(DATA_PROCESSED_DIR, f"{subject_id}_hr_scaler.json")
 
     print("=" * 70)
     print(f" Preprocessing Subject {subject_id} (USUBJID: {clean_target})")
@@ -352,6 +451,17 @@ def preprocess_subject(target_usubjid):
         sub_vs = pd.DataFrame()
         print("      No VS records found, heart rate will use a flat default.")
 
+    # 5b. Exercise sessions from PR (used ONLY to exclude exercise from the
+    #     resting HR baseline) --------------------------------------------------
+    print("      Loading exercise sessions (PR.xpt: PRSTDTC + PLNEXDUR)...")
+    df_exercise = load_exercise_intervals(clean_target)
+    if len(df_exercise):
+        print(f"      Found {len(df_exercise)} exercise sessions | "
+              f"first starts at {df_exercise['start'].iloc[0]} "
+              f"(check this lines up with the HR / CGM time range)")
+    else:
+        print("      No exercise sessions found in PR.xpt for this subject.")
+
     # 6. Sleep efficiency from NV: value held over [NVDTC, NVENDTC) ------------
     print("\n[6/6] Loading Sleep Efficiency (NV.xpt, NVTESTCD == 'SE')...")
     sub_nv = read_full_for_subject(
@@ -397,6 +507,13 @@ def preprocess_subject(target_usubjid):
     ).drop(columns=['datetime'])
     df_grid['output_cgm'] = df_grid['cgm'].interpolate(method='linear', limit=3)
 
+    # Train/test cutoff: first two calendar weeks = train (paper Section 2.4.1).
+    # Computed here (before the HR features) because the HR baseline and the
+    # HR scaler must be estimated from TRAINING data only. It is the same
+    # value the old code computed after the dropna below.
+    first_valid_time = df_grid.loc[df_grid['output_cgm'].notna(), 'datetime_local'].min()
+    train_cutoff = first_valid_time + pd.Timedelta(days=TRAIN_DAYS)
+
     # Insulin: basal rate (U/hr step-function) + bolus converted to U/hr
     #   Basal:  build_basal_dose_series already returns U/hr (not dose-per-bucket)
     #   Bolus:  FASTRESN is the bolus in Units; multiply by 12 (= 60 min / 5 min)
@@ -406,15 +523,32 @@ def preprocess_subject(target_usubjid):
     bolus_series = bucketize_point_events(df_bolus, 'FADTC', 'FASTRESN', grid)
     df_grid['input_insulin'] = basal_series.values + bolus_series.values * 12.0
 
-    # Carbs: bucketed dose (grams)
-    carbs_series = bucketize_point_events(df_carbs, 'FADTC', 'FASTRESN', grid)
+    # Carbs (v4): paper Sec. 2.4.1 style reconciliation of reported meals with
+    # boluses (90-min window, 1:1 pairing, bolus timestamp, missed-meal recovery,
+    # merging of per-food-item records). See meal_reconciliation.py.
+    df_meals, meal_stats = reconcile_meals(
+        df_carbs, df_bolus,
+        df_cgm=sub_lb[['datetime', 'cgm']],
+        train_cutoff=train_cutoff,
+    )
+    print_stats(meal_stats)
+    carbs_series = bucketize_point_events(df_meals, 'FADTC', 'FASTRESN', grid)
     df_grid['input_meal_carbs'] = carbs_series.values
 
-    # Heart rate (5-min mean of HRM samples; short gaps interpolated, long
-    # gaps set to the baseline so they contribute "no deviation")
-    hr_series, hr_baseline, hr_observed = build_hr_series(sub_vs, grid)
+    # Heart rate -----------------------------------------------------------
+    #  1) 5-min mean of HRM samples (NaN where the watch gave nothing)
+    #  2) baseline = mean resting HR: train period only, outside exercise
+    #  3) short gaps interpolated, long gaps = baseline ("no deviation")
+    hr_raw = bucket_hr(sub_vs, grid)
+    exercise_mask = build_exercise_mask(df_exercise, grid)
+    train_mask = pd.Series(grid < train_cutoff, index=grid)
+    hr_baseline, baseline_method = compute_hr_baseline(
+        hr_raw, exercise_mask, train_mask, has_exercise_log=len(df_exercise) > 0
+    )
+    hr_series = fill_hr_series(hr_raw, hr_baseline)
+    hr_observed = hr_raw.notna()
     df_grid['heart_rate'] = hr_series.values
-    df_grid['heart_rate_WRTbaseline'] = df_grid['heart_rate'] - hr_baseline
+    df_grid['heart_rate_WRTbaseline'] = df_grid['heart_rate'] - hr_baseline   # raw BPM
     df_grid['hr_observed'] = hr_observed.values   # temporary, for the log only
 
     # Sleep efficiency (held over the whole sleep interval)
@@ -433,17 +567,40 @@ def preprocess_subject(target_usubjid):
     df_grid = df_grid.dropna(subset=['output_cgm']).reset_index(drop=True)
     df_grid['time'] = df_grid['datetime_local'].dt.strftime('%Y-%m-%d %H:%M:%S')
 
-    # Train/test split: first two calendar weeks = train (paper Section 2.4.1)
-    cutoff = df_grid['datetime_local'].min() + pd.Timedelta(days=TRAIN_DAYS)
-    df_grid['is_train'] = df_grid['datetime_local'] < cutoff
+    # Train/test split (cutoff computed above)
+    df_grid['is_train'] = df_grid['datetime_local'] < train_cutoff
+
+    # Robust scaling of the HR deviation: constants from TRAIN rows only,
+    # then applied unchanged to every row (train + test). Observed buckets
+    # are preferred so baseline-filled gaps don't collapse the IQR.
+    fit_mask = df_grid['is_train'] & df_grid['hr_observed']
+    if int(fit_mask.sum()) < MIN_SCALER_BUCKETS:
+        fit_mask = df_grid['is_train']
+    hr_center, hr_scale = fit_robust_scaler(df_grid.loc[fit_mask, 'heart_rate_WRTbaseline'])
+    df_grid['heart_rate_WRTbaseline_scaled'] = \
+        (df_grid['heart_rate_WRTbaseline'] - hr_center) / hr_scale
+
+    with open(scaler_json, "w") as f:
+        json.dump({
+            "subject_id": subject_id,
+            "hr_baseline_bpm": hr_baseline,
+            "hr_baseline_method": baseline_method,
+            "scaler_center_median": hr_center,
+            "scaler_scale_iqr": hr_scale,
+            "scaler_fit_rows": int(fit_mask.sum()),
+            "train_cutoff": str(train_cutoff),
+            "exercise_sessions": int(len(df_exercise)),
+            "meal_reconciliation": {k: (None if (isinstance(v, float) and v != v) else v) for k, v in meal_stats.items()},
+        }, f, indent=2)
 
     hr_cov = 100.0 * float(df_grid['hr_observed'].mean())
     sleep_cov = 100.0 * float((df_grid['sleep_efficiency'] > 0).mean())
 
     # Reorder columns to match the expected schema
     final_cols = ['time', 'datetime_local', 'heart_rate', 'output_cgm', 'input_insulin',
-                  'input_meal_carbs', 'heart_rate_WRTbaseline', 'feat_is_weekend',
-                  'feat_hour_of_day_sin', 'feat_hour_of_day_cos', 'sleep_efficiency', 'is_train']
+                  'input_meal_carbs', 'heart_rate_WRTbaseline', 'heart_rate_WRTbaseline_scaled',
+                  'feat_is_weekend', 'feat_hour_of_day_sin', 'feat_hour_of_day_cos',
+                  'sleep_efficiency', 'is_train']
     df_out = df_grid[final_cols]
 
     df_out.to_csv(output_csv, index=False)
@@ -451,7 +608,10 @@ def preprocess_subject(target_usubjid):
     n_test = int((~df_out['is_train']).sum())
     print(f" SUCCESS! Preprocessed data saved to: {output_csv}")
     print(f" Total Samples: {len(df_out)} (Train: {n_train}, Test: {n_test})")
-    print(f" HR coverage (buckets with real samples): {hr_cov:.1f}% | HR baseline (median): {hr_baseline:.1f} BPM")
+    print(f" HR coverage (buckets with real samples): {hr_cov:.1f}%")
+    print(f" HR baseline: {hr_baseline:.1f} BPM  [{baseline_method}]")
+    print(f" HR robust scaler (train only): center={hr_center:.2f} BPM, IQR={hr_scale:.2f} BPM "
+          f"-> saved to {scaler_json}")
     print(f" Sleep coverage (buckets with sleep > 0): {sleep_cov:.1f}%")
     return output_csv, len(df_out), n_train, n_test, hr_cov, sleep_cov
 
@@ -465,7 +625,7 @@ def main():
     print("=" * 70)
     subject_ids = load_subject_list(INCLUDED_SUBJECTS_CSV)
     # أضف أو احذف أرقام المرضى هنا للتجربة
-    subject_ids = ["TT1DEXI-01-0781", "T1DEXI-01-1493", "T1DEXI-01-0436", "T1DEXI-01-1312", "T1DEXI-01-0446"    ]
+    subject_ids = ["T1DEXI-01-0011", "T1DEXI-01-0043", "T1DEXI-01-1004"]  # مثال: معالجة ثلاثة مرضى فقط
     print(f" Found {len(subject_ids)} subjects to preprocess.\n")
 
     results = []
