@@ -1,0 +1,6 @@
+subject_id,status,output_csv,n_total,n_train,n_test,hr_coverage_pct,sleep_coverage_pct,error
+TT1DEXI-01-0781,OK,D:\data_processed\T1DEXI-01-0781.csv,8000,4010,3990,85.7,18.5,
+T1DEXI-01-1493,OK,D:\data_processed\T1DEXI-01-1493.csv,7841,3891,3950,85.0,17.7,
+T1DEXI-01-0436,OK,D:\data_processed\T1DEXI-01-0436.csv,7933,4007,3926,85.7,29.9,
+T1DEXI-01-1312,OK,D:\data_processed\T1DEXI-01-1312.csv,7582,3949,3633,82.4,15.6,
+T1DEXI-01-0446,OK,D:\data_processed\T1DEXI-01-0446.csv,7538,3768,3770,85.8,20.5,

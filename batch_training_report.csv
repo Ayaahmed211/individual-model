@@ -1,0 +1,6 @@
+subject_id,status,reason,elapsed_minutes,final_rmse,info_csv_path
+TT1DEXI-01-0781,SKIPPED_NO_CSV,Dataset file not found at C:\Users\3com\OneDrive\Desktop\ind\T1DSim_AI\src\t1dsim_ai\models\IndividualModel\TT1DEXI-01-0781\T1DEXIMAIN_TT1DEXI-01-0781.csv,,,
+T1DEXI-01-1493,OK,,14.75,53.57748031616211,output_models/T1DEXI-01-1493\info.csv
+T1DEXI-01-0436,OK,,14.28,25.773332595825195,output_models/T1DEXI-01-0436\info.csv
+T1DEXI-01-1312,OK,,14.01,31.62744140625,output_models/T1DEXI-01-1312\info.csv
+T1DEXI-01-0446,OK,,13.73,47.87812042236328,output_models/T1DEXI-01-0446\info.csv

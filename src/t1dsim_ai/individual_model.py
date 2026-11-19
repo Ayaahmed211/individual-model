@@ -64,12 +64,11 @@ class ForwardEulerSimulator(nn.Module):
         self.ts = ts
         self.cgm_min = scale_single_state(40, "Q1", path_scaler)
         self.cgm_max = scale_single_state(400, "Q1", path_scaler)
+        df_init = pd.read_csv(Path(__file__).parent / "models/initSteadyStates.csv").set_index("initCGM")
+        self.q2_min = float(df_init.loc[40, "state_Q2"])
 
     def adjust_cgm(self, x):
-        x[x > self.cgm_max] = self.cgm_max
-        x[x < self.cgm_min] = self.cgm_min
-
-        return x
+        return torch.clamp(x, min=self.cgm_min, max=self.cgm_max)
 
     def forward(
         self, x0_batch: torch.Tensor, u_batch: torch.Tensor, u_batch_ind, is_pers=True
@@ -91,7 +90,6 @@ class ForwardEulerSimulator(nn.Module):
 
         """
 
-        # X_sim_list: List[torch.Tensor] = []
         X_sim_list: [torch.Tensor] = []
 
         x_step = x0_batch
@@ -106,21 +104,20 @@ class ForwardEulerSimulator(nn.Module):
 
             dx_pop = self.ss_pop_model(x_step, u_step)
 
-            dx = dx_pop
             if is_pers:
                 dx_ind = self.ss_ind_model(x_step, u_step, u_ind_step)
-                dx[:, 0] += dx_ind[:, 0]
-
-            x_step = x_step + self.ts * dx
-
-            if (len(x_step.shape)) == 1:
-                x_step[0] = self.adjust_cgm(x_step[0])
-
+                dx_q1 = dx_pop[..., :1] + dx_ind[..., :1]
+                dx = torch.cat([dx_q1, dx_pop[..., 1:]], dim=-1)
             else:
-                x_step[:, 0] = self.adjust_cgm(x_step[:, 0])
+                dx = dx_pop
+
+            x_next = x_step + self.ts * dx
+
+            q1 = self.adjust_cgm(x_next[..., :1])
+            q2 = torch.clamp(x_next[..., 1:2], min=self.q2_min)
+            x_step = torch.cat([q1, q2, x_next[..., 2:]], dim=-1)
 
         X_sim = torch.stack(X_sim_list, 0)
-
 
         return X_sim
 
@@ -185,11 +182,19 @@ class IndividualModel:
         self.df_subj = df_subj
         self.device = device
 
-        self.popModel = (
-            Path(__file__).parent
-            / "models/PopulationModel/population_model_05022024_epoch_15.pt"
-        )
-        self.popModelFolder = str(Path(__file__).parent) + "/models/PopulationModel/"
+        pop_dir = Path(__file__).parent / "models/PopulationModel"
+        user_pop_file = pop_dir / "population_model_trained.pt"
+        default_pop_file = pop_dir / "population_model_05022024_epoch_15.pt"
+        
+        if user_pop_file.exists():
+            self.popModel = user_pop_file
+        elif default_pop_file.exists():
+            self.popModel = default_pop_file
+        else:
+            pt_files = list(pop_dir.glob("*.pt"))
+            self.popModel = pt_files[0] if pt_files else user_pop_file
+
+        self.popModelFolder = str(pop_dir) + "/"
 
         self.pathModelFolder = pathModel
         self.pathModel = pathModel + subjectID
@@ -279,7 +284,7 @@ class IndividualModel:
         # Load population model
         self.ss_pop_model = CGMOHSUSimStateSpaceModel_V2(n_feat=n_neurons_pop)
         self.ss_pop_model.to(self.device)
-        self.ss_pop_model.load_state_dict(torch.load(self.popModel))
+        self.ss_pop_model.load_state_dict(torch.load(self.popModel, map_location=self.device))
 
         for name, param in self.ss_pop_model.named_parameters():
             param.requires_grad = False
@@ -400,7 +405,7 @@ class IndividualModel:
 
         if save_model:
             if not os.path.exists(self.pathModel):
-                os.mkdir(self.pathModel)
+                os.makedirs(self.pathModel, exist_ok=True)
             dump(
                 self.scaler_featsRobust,
                 open(self.pathModel + "/scaler_robust.pkl", "wb"),
@@ -734,19 +739,27 @@ class DigitalTwin:
     def setup_simulator(self):
         # Population Model
         ss_pop_model = CGMOHSUSimStateSpaceModel_V2(n_feat=n_neurons_pop)
-        ss_pop_model.to(self.device)
-        ss_pop_model.load_state_dict(
-            torch.load(
-                Path(__file__).parent
-                / "models/PopulationModel/population_model_05022024_epoch_15.pt"
-            )
-        )
+        
+        is_example = self.digital_twin_folder and "example" in str(self.digital_twin_folder).lower()
+        example_pop_dir = Path(__file__).parents[2] / "example/example_model/PopulationModel"
+
+        if is_example and example_pop_dir.exists():
+            pop_dir = example_pop_dir
+            pop_file = pop_dir / "population_model_05022024_epoch_15.pt"
+        else:
+            pop_dir = Path(__file__).parent / "models/PopulationModel"
+            user_pop_file = pop_dir / "population_model_trained.pt"
+            default_pop_file = pop_dir / "population_model_05022024_epoch_15.pt"
+            pop_file = user_pop_file if user_pop_file.exists() else (default_pop_file if default_pop_file.exists() else list(pop_dir.glob("*.pt"))[0])
+
+        self.pop_dir = str(pop_dir) + "/"
+        ss_pop_model.load_state_dict(torch.load(pop_file, map_location=self.device))
 
         # Individual Model
         ss_individual_model = CGMIndividual(hidden_compartments=hidden_compartments)
         ss_individual_model.to(self.device)
         ss_individual_model.load_state_dict(
-            torch.load(self.digital_twin_folder + "/individual_model.pt")
+            torch.load(self.digital_twin_folder + "/individual_model.pt", map_location=self.device)
         )
 
         for name, param in ss_pop_model.named_parameters():
@@ -758,7 +771,7 @@ class DigitalTwin:
         self.nn_solution = ForwardEulerSimulator(
             ss_pop_model,
             ss_individual_model,
-            str(Path(__file__).parent) + "/models/PopulationModel/",
+            self.pop_dir,
             ts=self.ts,
         )
 
@@ -767,28 +780,32 @@ class DigitalTwin:
         )
 
     def prepare_data(self, df_scenario):
-        dfInitStates = pd.read_csv(
-            Path(__file__).parent / "models/initSteadyStates.csv"
-        ).set_index("initCGM")
-
-        df_scenario[states] = df_scenario[states].astype(float)
-
-
-        df_scenario.loc[0, states] = dfInitStates.loc[
-            df_scenario.loc[0, states[0]].astype("int64"), states
-        ]
-
         sim_time = len(df_scenario)
-        batch_start = np.array([0], dtype=np.int)
+        batch_start = np.array([0], dtype=np.int64)
         batch_idx = batch_start[:, np.newaxis] + np.arange(sim_time)
 
-        x_est = np.array(df_scenario[states].values).astype(np.float32)
+        pop_model_dir = self.pop_dir
+
+        is_example = self.digital_twin_folder and "example" in str(self.digital_twin_folder).lower()
+        example_ss_file = Path(__file__).parents[2] / "example/example_model/initSteadyStates.csv"
+        if is_example and example_ss_file.exists():
+            ss_file = example_ss_file
+        else:
+            ss_file = Path(__file__).parent / "models/initSteadyStates.csv"
+
+        dfInitStates = pd.read_csv(ss_file).set_index("initCGM")
+
+        # Initial state x0 looked up from calibrated initSteadyStates.csv
+        actual_cgm0 = int(np.clip(round(float(df_scenario["output_cgm"].iloc[0])), 40, 400))
+        x0_arr = dfInitStates.loc[actual_cgm0, states].values.astype(np.float32).reshape(1, -1)
+        x0_est = torch.tensor(x0_arr, dtype=torch.float32).to(self.device)
+
         u_pop = np.array(df_scenario[inputs].values).astype(np.float32)
         u_ind = np.array(df_scenario[input_ind].values).astype(np.float32)
 
-        # Scale states and inputs from the population models
-        x_est, u_pop = scaler_pop(
-            x_est, u_pop, str(Path(__file__).parent) + "/models/PopulationModel/", False
+        # Scale inputs from population models
+        _, u_pop = scaler_pop(
+            np.zeros((sim_time, len(states))), u_pop, pop_model_dir, False
         )
 
         # Scale new inputs
@@ -796,11 +813,6 @@ class DigitalTwin:
 
         u_pop = u_pop.reshape(-1, sim_time, len(inputs))[0, batch_idx, :]
         u_ind = u_ind.reshape(-1, sim_time, len(input_ind))[0, batch_idx, :]
-
-        x0_est = torch.tensor(
-            df_scenario.loc[0, states].astype(float).values.reshape(1, -1),
-            dtype=torch.float32,
-        ).to(self.device)
 
         u_pop = torch.tensor(u_pop[[0], batch_idx.T], dtype=torch.float32).to(
             self.device
@@ -815,7 +827,7 @@ class DigitalTwin:
         # Prepare data
 
         df_scenario = df_scenario_original.copy()
-        df_scenario = df_scenario.reset_index()
+        df_scenario = df_scenario.reset_index(drop=True)
         try:
             df_scenario[states]
         except KeyError:
@@ -829,14 +841,14 @@ class DigitalTwin:
             x_sim_pop = self.nn_solution(x0_est, u_pop, None, is_pers=False)
             df_scenario[states] = scaler_inverse(
                 x_sim_pop[:, 0, :].to("cpu").detach().numpy(),
-                str(Path(__file__).parent) + "/models/PopulationModel/",
+                self.pop_dir,
             )
 
             x_sim_DT = self.nn_solution(x0_est, u_pop, u_ind, is_pers=True)
 
             df_scenario[[s + "_DT" for s in states]] = scaler_inverse(
                 x_sim_DT[:, 0, :].to("cpu").detach().numpy(),
-                str(Path(__file__).parent) + "/models/PopulationModel/",
+                self.pop_dir,
             )
 
         df_scenario["cgm_NNPop"] = df_scenario["output_cgm"]

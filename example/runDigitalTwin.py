@@ -5,9 +5,16 @@ from t1dsim_ai.utils import metrics
 import numpy as np
 import matplotlib.pyplot as plt
 
-df_simulation = pd.read_csv("example_model/data_example.csv")
+import os
+from pathlib import Path
+
+example_dir = Path(__file__).resolve().parent
+data_path = example_dir / "example_model/data_example.csv"
+dt_model_path = example_dir / "example_model/DT_Example"
+
+df_simulation = pd.read_csv(data_path)
 df_simulation = df_simulation[~df_simulation.is_train]
-myDigitalTwin = DigitalTwin(custom_DT='/Users/roquemev/Library/CloudStorage/OneDrive-OregonHealth&ScienceUniversity/Documents/OHSU/Tools/T1DSim_AI/example/example_model/DT_Example/')
+myDigitalTwin = DigitalTwin(custom_DT=str(dt_model_path))
 df_simulation = myDigitalTwin.simulate(df_simulation.iloc[1 * 12 * 24 : 2 * 12 * 24])
 
 # Visualization
@@ -90,8 +97,10 @@ plt.subplots_adjust(hspace=0)
 
 # plt.show()
 
+out_path = example_dir / f"img/example_digitaltwin{myDigitalTwin.n_digitalTwin}.png"
+out_path.parent.mkdir(parents=True, exist_ok=True)
 plt.savefig(
-    "img/example_digitaltwin" + str(myDigitalTwin.n_digitalTwin) + ".png",
+    str(out_path),
     dpi=500,
     bbox_inches="tight",
 )
